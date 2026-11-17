@@ -209,89 +209,163 @@ Deno.serve(async (req: Request) => {
       messages.push({ role: msg.role, content: msg.content });
     }
 
-    // ─── 8. Call AI API ────────────────────────────────────────
-    const openaiKey = Deno.env.get("OPENAI_API_KEY");
+    
+// 8. Call AI API: OpenAI Primary + Gemini Fallback
 
-    if (!openaiKey) {
-      // AI key not configured — save a fallback assistant message and return clear error
-      const fallbackMsg =
-        "Maaf, layanan Konsultan AI belum dikonfigurasi. Silakan hubungi administrator untuk mengaktifkan fitur ini.";
+const openaiKey = Deno.env.get("OPENAI_API_KEY");
+const geminiKey = Deno.env.get("GEMINI_API_KEY");
 
-      await adminClient
-        .from("ai_messages")
-        .insert({
-          conversation_id: convId,
-          user_id: user.id,
-          role: "assistant",
-          content: fallbackMsg,
-        });
+const geminiModel =
+  Deno.env.get("GEMINI_MODEL") || "gemini-2.5-flash";
 
-      // Update conversation timestamp
-      await adminClient
-        .from("ai_conversations")
-        .update({ updated_at: new Date().toISOString() })
-        .eq("id", convId);
+// Ubah riwayat percakapan menjadi format OpenAI
+const openaiMessages = [
+  {
+    role: "system",
+    content: SYSTEM_PROMPT,
+  },
+  ...history.map((msg: any) => ({
+    role: msg.role,
+    content: msg.content,
+  })),
+];
 
-      return new Response(
-        JSON.stringify({
-          reply: fallbackMsg,
-          conversationId: convId,
-          aiUnavailable: true,
-        }),
-        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
+// Fungsi pemanggilan OpenAI
+async function callOpenAI(): Promise<string> {
+  if (!openaiKey) {
+    throw new Error("OPENAI_NOT_CONFIGURED");
+  }
 
-    const aiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
+  const response = await fetch(
+    "https://api.openai.com/v1/chat/completions",
+    {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${openaiKey}`,
+        Authorization: `Bearer ${openaiKey}`,
       },
       body: JSON.stringify({
         model: "gpt-4o-mini",
-        messages,
-        max_tokens: 800,
+        messages: openaiMessages,
         temperature: 0.7,
       }),
-      signal: AbortSignal.timeout(30_000),
-    });
+    }
+  );
 
-    if (!aiResponse.ok) {
-      const errorText = await aiResponse.text();
-      console.error("AI API error:", aiResponse.status, errorText);
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    const errorCode = errorData?.error?.code;
 
-      // Distinguish the failure modes so the user gets an actionable message:
-      // 401/403 → key invalid or revoked (configuration problem, not transient)
-      // 429 with insufficient_quota → billing/quota problem on the OpenAI account
-      // 429 otherwise → transient rate limit, retry makes sense
-      let errorMsg = "Terjadi kesalahan saat menghubungi layanan AI. Silakan coba lagi.";
-      if (aiResponse.status === 401 || aiResponse.status === 403) {
-        errorMsg =
-          "Layanan AI menolak kredensial server. Hubungi administrator — kunci API AI perlu diperiksa.";
-      } else if (aiResponse.status === 429) {
-        let quotaExhausted = false;
-        try {
-          const errBody = JSON.parse(errorText);
-          quotaExhausted = errBody?.error?.type === "insufficient_quota";
-        } catch {
-          // keep false on unparseable body
-        }
-        errorMsg = quotaExhausted
-          ? "Kuota layanan AI telah habis. Hubungi administrator untuk menambahkan kuota."
-          : "Layanan AI sedang sibuk. Silakan coba lagi dalam beberapa saat.";
-      }
-
-      return new Response(
-        JSON.stringify({ error: errorMsg, conversationId: convId }),
-        { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+    // Hanya gangguan sementara atau kuota yang memicu fallback
+    if (
+      response.status === 429 ||
+      response.status >= 500
+    ) {
+      throw new Error("OPENAI_TEMPORARY_ERROR");
     }
 
-    const aiData = await aiResponse.json();
-    const reply =
-      aiData?.choices?.[0]?.message?.content ??
-      "Maaf, saya tidak dapat memberikan respons saat ini. Silakan coba lagi.";
+    if (errorCode === "insufficient_quota") {
+      throw new Error("OPENAI_TEMPORARY_ERROR");
+    }
+
+    throw new Error("OPENAI_REQUEST_ERROR");
+  }
+
+  const data = await response.json();
+  const answer = data?.choices?.[0]?.message?.content;
+
+  if (!answer) {
+    throw new Error("OPENAI_EMPTY_RESPONSE");
+  }
+
+  return answer;
+}
+
+// Fungsi pemanggilan Gemini
+async function callGemini(): Promise<string> {
+  if (!geminiKey) {
+    throw new Error("GEMINI_NOT_CONFIGURED");
+  }
+
+  const contents = history.map((msg: any) => ({
+    role: msg.role === "assistant" ? "model" : "user",
+    parts: [{ text: msg.content }],
+  }));
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${geminiKey}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        systemInstruction: {
+          parts: [{ text: SYSTEM_PROMPT }],
+        },
+        contents,
+        generationConfig: {
+          temperature: 0.7,
+        },
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error("GEMINI_REQUEST_ERROR");
+  }
+
+  const data = await response.json();
+  const answer = data?.candidates?.[0]?.content?.parts
+    ?.map((part: any) => part.text || "")
+    .join("")
+    .trim();
+
+  if (!answer) {
+    throw new Error("GEMINI_EMPTY_RESPONSE");
+  }
+
+  return answer;
+}
+
+// Pilih AI dan jalankan fallback
+let assistantReply = "";
+let aiProvider = "";
+
+try {
+  if (openaiKey) {
+    assistantReply = await callOpenAI();
+    aiProvider = "openai";
+  } else {
+    throw new Error("OPENAI_NOT_CONFIGURED");
+  }
+} catch (error) {
+  const errorMessage =
+    error instanceof Error ? error.message : "";
+
+  const canFallback = [
+    "OPENAI_NOT_CONFIGURED",
+    "OPENAI_TEMPORARY_ERROR",
+  ].includes(errorMessage);
+
+  if (!canFallback) {
+    throw error;
+  }
+
+  if (!geminiKey) {
+    throw new Error("AI_SERVICES_UNAVAILABLE");
+  }
+
+  assistantReply = await callGemini();
+  aiProvider = "gemini";
+}
+
+console.log("AI provider used:", aiProvider);
+
+// Gunakan assistantReply sebagai jawaban AI.
+// Lanjutkan proses penyimpanan pesan assistant
+// menggunakan mekanisme penyimpanan yang sudah ada.
+
 
     // ─── 9. Save assistant message ─────────────────────────────
     await adminClient
