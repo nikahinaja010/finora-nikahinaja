@@ -254,16 +254,33 @@ Deno.serve(async (req: Request) => {
         max_tokens: 800,
         temperature: 0.7,
       }),
+      signal: AbortSignal.timeout(30_000),
     });
 
     if (!aiResponse.ok) {
       const errorText = await aiResponse.text();
       console.error("AI API error:", aiResponse.status, errorText);
 
-      const errorMsg =
-        aiResponse.status === 429
-          ? "Layanan AI saat ini sibuk. Silakan coba lagi dalam beberapa saat."
-          : "Terjadi kesalahan saat menghubungi layanan AI. Silakan coba lagi.";
+      // Distinguish the failure modes so the user gets an actionable message:
+      // 401/403 → key invalid or revoked (configuration problem, not transient)
+      // 429 with insufficient_quota → billing/quota problem on the OpenAI account
+      // 429 otherwise → transient rate limit, retry makes sense
+      let errorMsg = "Terjadi kesalahan saat menghubungi layanan AI. Silakan coba lagi.";
+      if (aiResponse.status === 401 || aiResponse.status === 403) {
+        errorMsg =
+          "Layanan AI menolak kredensial server. Hubungi administrator — kunci API AI perlu diperiksa.";
+      } else if (aiResponse.status === 429) {
+        let quotaExhausted = false;
+        try {
+          const errBody = JSON.parse(errorText);
+          quotaExhausted = errBody?.error?.type === "insufficient_quota";
+        } catch {
+          // keep false on unparseable body
+        }
+        errorMsg = quotaExhausted
+          ? "Kuota layanan AI telah habis. Hubungi administrator untuk menambahkan kuota."
+          : "Layanan AI sedang sibuk. Silakan coba lagi dalam beberapa saat.";
+      }
 
       return new Response(
         JSON.stringify({ error: errorMsg, conversationId: convId }),
